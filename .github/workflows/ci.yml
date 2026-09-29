@@ -1,0 +1,94 @@
+# CI/CD: test + build trên mọi push/PR vào main; chỉ deploy lên Render khi
+# cả hai xanh và là push vào main. Render đặt autoDeploy: false trong
+# render.yaml nên mọi lần deploy đều đi qua cổng này.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (CP1-CP4)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # test_cp5 gọi bản deploy đang sống, test_bonus_cicd kiểm tra badge của
+      # chính workflow này; test build image nằm ở job build.
+      - name: Run pytest
+        env:
+          AGENT_API_KEY: ci-dummy
+          REDIS_URL: "fake://"
+        run: pytest tests/ -v -m "not docker" --ignore=tests/test_cp5.py --ignore=tests/test_bonus_cicd.py
+
+  build:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t day12-agent:${{ github.sha }} .
+
+      - name: Smoke test container
+        run: |
+          docker run -d --name agent -p 8000:8000 \
+            -e AGENT_API_KEY=ci-dummy -e REDIS_URL=fake:// \
+            day12-agent:${{ github.sha }}
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:8000/health && exit 0
+            sleep 1
+          done
+          docker logs agent
+          exit 1
+
+  deploy:
+    name: Deploy to Render
+    needs: [test, build]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Trigger Render deploy hook
+        env:
+          DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -z "$DEPLOY_HOOK" ]; then
+            echo "::error::Secret RENDER_DEPLOY_HOOK_URL chưa được cấu hình"
+            exit 1
+          fi
+          curl -fsS -X POST "$DEPLOY_HOOK" > /dev/null
+
+      # Bản cũ vẫn trả /health trong lúc bản mới build, nên đợi trước rồi mới
+      # kiểm tra; Render free tier có thể mất vài phút.
+      - name: Smoke test deployed service
+        env:
+          PUBLIC_URL: ${{ vars.PUBLIC_URL }}
+        run: |
+          sleep 90
+          for i in $(seq 1 30); do
+            if curl -fsS "$PUBLIC_URL/health" && curl -fsS "$PUBLIC_URL/ready"; then
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1

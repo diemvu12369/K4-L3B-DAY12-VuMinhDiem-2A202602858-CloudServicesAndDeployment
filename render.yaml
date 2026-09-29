@@ -10,6 +10,8 @@ services:
     dockerfilePath: ./Dockerfile
     plan: free
     healthCheckPath: /health
+    # Deploy chỉ chạy qua GitHub Actions (deploy hook) sau khi test/build xanh
+    autoDeploy: false
     envVars:
       - key: AGENT_API_KEY
         sync: false
